@@ -2,22 +2,23 @@
 # coding=utf8
 
 """
-Combined Avoidance and Color Detection  HiWonder TurboPi
+Combined Avoidance and Color Detection - HiWonder TurboPi
 
 This version integrates:
-  the color detection prototype structure
-  the newer sweep-based obstacle avoidance behavior
+- color detection
+- sweep-based obstacle avoidance
+- live tuning tools for HSV ranges and contour area
 
-Architecture:
-  VisionThread -   camera loop; updates detected_color + annotated frame
-  Main loop   -    reads sonar + color; owns all motor commands
+Important fix:
+- All cv2.imshow() and cv2.waitKey() calls are handled in the main thread only.
+- The vision thread only processes images and updates shared state.
 
-Priority:
-  1. Sonar obstacle    -> avoidance FSM (REVERSE / TURN / RECOVER)
-  2. Traffic RED       -> stop
-  3. Traffic YELLOW    -> slow sweeping forward motion
-  4. Traffic GREEN     -> normal sweeping forward motion
-  5. No signal         -> normal sweeping forward motion
+Tuning features:
+- center sampling box
+- center BGR and HSV display
+- contour area display for red / yellow / green
+- optional mask windows for each color
+- throttled debug prints in terminal
 """
 
 import sys
@@ -86,12 +87,22 @@ CAMERA_FPS = 30
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Color detection parameters
+# Color detection tuning parameters
 # ─────────────────────────────────────────────────────────────────────────────
 MIN_CONTOUR_AREA = 1500
 DETECTION_CONFIRM = 3
 COLOR_DEBOUNCE_S = 0.4
 
+VISION_DEBUG = True
+VISION_DEBUG_PERIOD = 0.25
+SHOW_MASKS = True
+
+SAMPLE_BOX_HALF = 8
+
+# OpenCV HSV:
+# H: 0-179
+# S: 0-255
+# V: 0-255
 COLOR_RANGES = {
     "red": [
         (np.array([0,   120,  70]), np.array([10,  255, 255])),
@@ -111,9 +122,20 @@ COLOR_RANGES = {
 # ─────────────────────────────────────────────────────────────────────────────
 detected_color = "none"
 shared_frame = None
+last_color_areas = {"red": 0, "yellow": 0, "green": 0}
+last_center_bgr = None
+last_center_hsv = None
+last_sample_box = None
+
+shared_red_mask = None
+shared_yellow_mask = None
+shared_green_mask = None
 
 color_lock = threading.Lock()
 frame_lock = threading.Lock()
+area_lock = threading.Lock()
+mask_lock = threading.Lock()
+sample_lock = threading.Lock()
 stop_event = threading.Event()
 
 running = True
@@ -233,13 +255,10 @@ class RobotFSM:
 
         if new_state == State.CRUISE:
             set_led_color('green')
-
         elif new_state == State.REVERSE:
             set_led_color('red')
-
         elif new_state == State.TURN:
             set_led_color('blue')
-
         elif new_state == State.RECOVER:
             set_led_color('purple')
 
@@ -252,14 +271,12 @@ class RobotFSM:
         if self.state == State.CRUISE:
             cooldown_done = (now - self.last_avoid_end_time) >= COOLDOWN_TIME
 
-            # Highest priority: sonar obstacle
             if cooldown_done and obstacle_detected(distance_cm, SAFE_DISTANCE_CM):
                 if DEBUG_PRINT:
                     print('Sonar obstacle detected -> REVERSE')
                 self.set_state(State.REVERSE)
                 return
 
-            # Otherwise obey traffic-light color
             if color_name == 'red':
                 set_led_color('red')
                 self.motion.stop_car()
@@ -319,8 +336,36 @@ def largest_contour_area(mask: np.ndarray) -> int:
     return int(cv2.contourArea(max(contours, key=cv2.contourArea)))
 
 
+def get_center_box_values(frame: np.ndarray, hsv: np.ndarray):
+    """
+    Average BGR and HSV values inside a small box at the frame center.
+    This is more stable than using a single pixel.
+    """
+    h, w = frame.shape[:2]
+    cx = w // 2
+    cy = h // 2
+
+    x1 = max(0, cx - SAMPLE_BOX_HALF)
+    x2 = min(w, cx + SAMPLE_BOX_HALF + 1)
+    y1 = max(0, cy - SAMPLE_BOX_HALF)
+    y2 = min(h, cy + SAMPLE_BOX_HALF + 1)
+
+    bgr_roi = frame[y1:y2, x1:x2]
+    hsv_roi = hsv[y1:y2, x1:x2]
+
+    bgr_mean = np.mean(bgr_roi.reshape(-1, 3), axis=0)
+    hsv_mean = np.mean(hsv_roi.reshape(-1, 3), axis=0)
+
+    center_bgr = tuple(int(v) for v in bgr_mean)
+    center_hsv = tuple(int(v) for v in hsv_mean)
+
+    return (cx, cy, x1, y1, x2, y2), center_bgr, center_hsv
+
+
 def draw_overlay(frame: np.ndarray, color: str, areas: dict,
-                 fsm_state: str = "", distance_cm: float = -1.0) -> np.ndarray:
+                 fsm_state: str = "", distance_cm: float = -1.0,
+                 center_bgr=None, center_hsv=None,
+                 sample_box=None) -> np.ndarray:
     overlay = frame.copy()
     label_color = {
         "red": (0, 0, 255),
@@ -334,7 +379,7 @@ def draw_overlay(frame: np.ndarray, color: str, areas: dict,
         f"Detected: {color.upper()}",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
+        0.9,
         label_color.get(color, (255, 255, 255)),
         2
     )
@@ -354,26 +399,63 @@ def draw_overlay(frame: np.ndarray, color: str, areas: dict,
         cv2.putText(
             overlay,
             f"Dist: {distance_cm:.1f} cm",
-            (10, 88),
+            (10, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
             2
         )
 
-    row = 120
-    for c, area in areas.items():
-        if area > MIN_CONTOUR_AREA:
-            cv2.putText(
-                overlay,
-                f"{c}: {area}px",
-                (10, row),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                label_color.get(c, (200, 200, 200)),
-                1
-            )
-            row += 25
+    if center_bgr is not None:
+        cv2.putText(
+            overlay,
+            f"BGR: {center_bgr}",
+            (10, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1
+        )
+
+    if center_hsv is not None:
+        cv2.putText(
+            overlay,
+            f"HSV: {center_hsv}",
+            (10, 145),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1
+        )
+
+    row = 175
+    for c in ["red", "yellow", "green"]:
+        area = areas.get(c, 0)
+        cv2.putText(
+            overlay,
+            f"{c}: {area}px",
+            (10, row),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            label_color.get(c, (200, 200, 200)),
+            1
+        )
+        row += 25
+
+    cv2.putText(
+        overlay,
+        f"MIN_CONTOUR_AREA: {MIN_CONTOUR_AREA}",
+        (10, row + 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1
+    )
+
+    if sample_box is not None:
+        cx, cy, x1, y1, x2, y2 = sample_box
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 255), 2)
+        cv2.circle(overlay, (cx, cy), 3, (255, 255, 255), -1)
 
     return overlay
 
@@ -382,7 +464,15 @@ def draw_overlay(frame: np.ndarray, color: str, areas: dict,
 # Vision thread
 # ─────────────────────────────────────────────────────────────────────────────
 def vision_thread() -> None:
-    global detected_color, shared_frame
+    global detected_color
+    global shared_frame
+    global last_color_areas
+    global last_center_bgr
+    global last_center_hsv
+    global last_sample_box
+    global shared_red_mask
+    global shared_yellow_mask
+    global shared_green_mask
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
@@ -396,6 +486,7 @@ def vision_thread() -> None:
 
     confirm_counts = {c: 0 for c in COLOR_RANGES}
     last_event_time = 0.0
+    last_vision_debug_time = 0.0
 
     print("[Vision] thread started")
 
@@ -405,17 +496,30 @@ def vision_thread() -> None:
             time.sleep(0.05)
             continue
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hsv = cv2.GaussianBlur(hsv, (7, 7), 0)
+        blurred = cv2.GaussianBlur(frame, (7, 7), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        areas = {c: largest_contour_area(apply_mask(hsv, c)) for c in COLOR_RANGES}
+        sample_box, center_bgr, center_hsv = get_center_box_values(frame, hsv)
+
+        red_mask = apply_mask(hsv, "red")
+        yellow_mask = apply_mask(hsv, "yellow")
+        green_mask = apply_mask(hsv, "green")
+
+        areas = {
+            "red": largest_contour_area(red_mask),
+            "yellow": largest_contour_area(yellow_mask),
+            "green": largest_contour_area(green_mask),
+        }
 
         dominant = max(areas, key=areas.get)
         if areas[dominant] < MIN_CONTOUR_AREA:
             dominant = "none"
 
         for c in COLOR_RANGES:
-            confirm_counts[c] = confirm_counts[c] + 1 if c == dominant else 0
+            if c == dominant:
+                confirm_counts[c] += 1
+            else:
+                confirm_counts[c] = 0
 
         confirmed = "none"
         for c in COLOR_RANGES:
@@ -424,20 +528,42 @@ def vision_thread() -> None:
                 break
 
         now = time.time()
-        if confirmed != "none" and (now - last_event_time) >= COLOR_DEBOUNCE_S:
-            last_event_time = now
 
-        with color_lock:
-            detected_color = confirmed
-
-        # Pull current state for annotation
-        with color_lock:
-            current_color = detected_color
-
-        annotated = draw_overlay(frame, current_color, areas)
+        if confirmed != "none":
+            if (now - last_event_time) >= COLOR_DEBOUNCE_S:
+                with color_lock:
+                    detected_color = confirmed
+                last_event_time = now
+        else:
+            with color_lock:
+                detected_color = "none"
 
         with frame_lock:
-            shared_frame = annotated
+            shared_frame = frame.copy()
+
+        with area_lock:
+            last_color_areas = areas.copy()
+
+        with sample_lock:
+            last_center_bgr = center_bgr
+            last_center_hsv = center_hsv
+            last_sample_box = sample_box
+
+        with mask_lock:
+            shared_red_mask = red_mask.copy()
+            shared_yellow_mask = yellow_mask.copy()
+            shared_green_mask = green_mask.copy()
+
+        if VISION_DEBUG and (now - last_vision_debug_time) >= VISION_DEBUG_PERIOD:
+            print(
+                f"[Vision] "
+                f"BGR={center_bgr} "
+                f"HSV={center_hsv} "
+                f"areas={areas} "
+                f"dominant={dominant} "
+                f"confirmed={confirmed}"
+            )
+            last_vision_debug_time = now
 
     cap.release()
     print("[Vision] thread exited")
@@ -504,6 +630,7 @@ def main():
     print(f'TURN_DIRECTION        = {TURN_DIRECTION}')
     print(f'SWEEP_YAW_AMPLITUDE   = {SWEEP_YAW_AMPLITUDE}')
     print(f'SWEEP_PERIOD          = {SWEEP_PERIOD:.2f} s')
+    print(f'MIN_CONTOUR_AREA      = {MIN_CONTOUR_AREA}')
     print('Press Ctrl+C to stop\n')
 
     while running and not stop_event.is_set():
@@ -514,6 +641,22 @@ def main():
         with color_lock:
             color = detected_color
 
+        with area_lock:
+            areas = last_color_areas.copy()
+
+        with sample_lock:
+            center_bgr = last_center_bgr
+            center_hsv = last_center_hsv
+            sample_box = last_sample_box
+
+        with frame_lock:
+            frame = None if shared_frame is None else shared_frame.copy()
+
+        with mask_lock:
+            red_mask_disp = None if shared_red_mask is None else shared_red_mask.copy()
+            yellow_mask_disp = None if shared_yellow_mask is None else shared_yellow_mask.copy()
+            green_mask_disp = None if shared_green_mask is None else shared_green_mask.copy()
+
         fsm.update(filtered_distance, color)
 
         now = time.time()
@@ -522,19 +665,35 @@ def main():
                 f'State={fsm.state.name:8s} | '
                 f'Dist={filtered_distance:5.1f} cm | '
                 f'Color={color.upper():6s} | '
+                f'Areas={areas} | '
                 f'Cmd={motion.command:13s} | '
                 f'Yaw={motion.last_yaw:6.3f}'
             )
             last_debug_time = now
 
-        with frame_lock:
-            frame = shared_frame
-
         if frame is not None:
-            annotated = draw_overlay(frame, color, {}, fsm.state.name, filtered_distance)
+            annotated = draw_overlay(
+                frame,
+                color,
+                areas,
+                fsm.state.name,
+                filtered_distance,
+                center_bgr=center_bgr,
+                center_hsv=center_hsv,
+                sample_box=sample_box
+            )
             cv2.imshow("Combined Avoidance", annotated)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if SHOW_MASKS:
+            if red_mask_disp is not None:
+                cv2.imshow("Mask Red", red_mask_disp)
+            if yellow_mask_disp is not None:
+                cv2.imshow("Mask Yellow", yellow_mask_disp)
+            if green_mask_disp is not None:
+                cv2.imshow("Mask Green", green_mask_disp)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
 
         time.sleep(LOOP_DELAY)
