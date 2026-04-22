@@ -1,37 +1,36 @@
 #!/usr/bin/python3
 # coding=utf8
-"""
-TurboPi Obstacle Avoidance Demo
 
-Standalone, ROS-free obstacle avoidance script for the Hiwonder TurboPi.
-This uses the same library style as the TurboPi example code:
-- HiwonderSDK.mecanum for chassis motion
-- HiwonderSDK.Sonar for ultrasonic distance
-- HiwonderSDK.ros_robot_controller_sdk for board RGB/buzzer helpers
+"""
+TurboPi obstacle avoidance demo with FSM + sweeping cruise motion.
 
 Behavior:
-1. Drive forward normally
-2. Continuously read the ultrasonic sensor
-3. If an obstacle is too close:
-   - stop
-   - reverse briefly
-   - turn left for a fixed time
-   - move forward briefly
-4. Resume forward driving
+1. Cruise forward in a gentle sweeping motion
+2. Continuously read the front ultrasonic sensor
+3. If an obstacle is detected within the safe distance:
+   - reverse
+   - turn away
+   - move forward to recover
+4. Resume sweeping cruise
+
+Why sweeping helps:
+- A single front-facing sonar only sees what is roughly in front of it
+- By gently sweeping the car while moving forward, the sonar samples a wider area
+- This improves detection of obstacles that are slightly off-center
 
 Notes:
-- No ROS is used here.
-- The board module filename contains "ros" because of the vendor SDK, but this
-  script does not use ROS nodes, topics, launches, or roscore.
-- Start with a simple fixed left turn. Once this works, you can extend it.
+- No ROS is used
+- No IMU is used
 """
 
 import sys
 sys.path.append('/home/pi/TurboPi/')
 
 import time
+import math
 import signal
 import numpy as np
+from enum import Enum, auto
 
 import HiwonderSDK.Sonar as Sonar
 import HiwonderSDK.mecanum as mecanum
@@ -46,22 +45,30 @@ if sys.version_info.major == 2:
 # ============================================================
 # USER PARAMETERS
 # ============================================================
-FORWARD_SPEED = 35               # normal forward speed
-REVERSE_SPEED = 30               # reverse speed during avoidance
-SAFE_DISTANCE_CM = 24.0          # trigger distance threshold
-DIST_WINDOW = 5                  # moving-average window length
-LOOP_DELAY = 0.05                # main loop period in seconds
 
-STOP_PAUSE = 0.15                # short pause after stopping
-REVERSE_TIME = 0.40              # how long to back up
-TURN_TIME = 0.65                 # how long to turn
-FORWARD_RECOVERY_TIME = 0.45     # move forward after turning
-COOLDOWN_TIME = 1.00             # time before another avoidance can trigger
+# Motion settings
+FORWARD_SPEED = 35
+REVERSE_SPEED = 30
+TURN_YAW = 0.45
+TURN_DIRECTION = 'left'      # 'left' or 'right'
 
-TURN_DIRECTION = 'left'          # 'left' or 'right'
-TURN_YAW = 0.45                  # yaw command magnitude for turning
+# Sweeping cruise settings
+SWEEP_YAW_AMPLITUDE = 0.20   # how hard the robot weaves left/right
+SWEEP_PERIOD = 1.80          # seconds for one full left-right-left sweep
 
+# Sonar settings
+SAFE_DISTANCE_CM = 24.0
+DIST_WINDOW = 5
+
+# FSM timing
+LOOP_DELAY = 0.05
+REVERSE_TIME = 0.40
+TURN_TIME = 0.65
+FORWARD_RECOVERY_TIME = 0.45
+
+# Debug
 DEBUG_PRINT = True
+DEBUG_PRINT_PERIOD = 0.20
 
 
 # ============================================================
@@ -72,15 +79,24 @@ sonar = Sonar.Sonar()
 board = rrc.Board()
 
 running = False
-last_avoid_time = 0.0
 last_distance_cm = 999.0
+
+
+# ============================================================
+# FSM STATES
+# ============================================================
+class State(Enum):
+    CRUISE = auto()
+    REVERSE = auto()
+    TURN = auto()
+    RECOVER = auto()
 
 
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 def set_led_color(name):
-    """Set onboard RGB LEDs to show current behavior."""
+    """Set onboard RGB LEDs to show current state."""
     try:
         if name == 'green':
             board.set_rgb([[1, 0, 255, 0], [2, 0, 255, 0]])
@@ -90,6 +106,8 @@ def set_led_color(name):
             board.set_rgb([[1, 255, 150, 0], [2, 255, 150, 0]])
         elif name == 'blue':
             board.set_rgb([[1, 0, 0, 255], [2, 0, 0, 255]])
+        elif name == 'purple':
+            board.set_rgb([[1, 255, 0, 255], [2, 255, 0, 255]])
         else:
             board.set_rgb([[1, 0, 0, 0], [2, 0, 0, 0]])
     except Exception:
@@ -97,50 +115,35 @@ def set_led_color(name):
 
 
 def beep_once():
-    """Optional beep when an obstacle is detected."""
+    """Short buzzer beep for transition/debug feedback."""
     try:
         board.set_buzzer(1900, 0.08, 0.05, 1)
     except Exception:
         pass
 
 
-def stop_car():
-    """Stop all chassis motion."""
-    car.set_velocity(0, 90, 0)
-
-
-def drive_forward(speed=FORWARD_SPEED):
-    """Move forward.
-
-    TurboPi uses set_velocity(speed, direction, yaw_rate).
-    direction=90 corresponds to forward in the vendor examples.
-    yaw_rate=0 means no turning.
+def read_distance_cm():
     """
-    car.set_velocity(speed, 90, 0)
+    Read ultrasonic distance in centimeters.
 
-
-def drive_reverse(speed=REVERSE_SPEED):
-    """Move backward.
-
-    direction=270 corresponds to reverse in the vendor examples.
+    TurboPi sonar.getDistance() returns millimeters.
     """
-    car.set_velocity(speed, 270, 0)
-
-
-def turn_in_place(direction='left', yaw=TURN_YAW):
-    """Rotate in place using chassis yaw control."""
-    if direction == 'left':
-        car.set_velocity(0, 90, -abs(yaw))
-    else:
-        car.set_velocity(0, 90, abs(yaw))
+    raw_mm = sonar.getDistance()
+    return raw_mm / 10.0
 
 
 def cleanup():
     """Safe shutdown."""
     global running
     running = False
-    stop_car()
+
+    try:
+        car.set_velocity(0, 90, 0)
+    except Exception:
+        pass
+
     set_led_color('off')
+
     try:
         sonar.setRGBMode(0)
         sonar.setPixelColor(0, (0, 0, 0))
@@ -150,18 +153,16 @@ def cleanup():
 
 
 def handle_signal(signum, frame):
-    """Catch Ctrl+C and stop safely."""
-    print('\nStopping obstacle avoidance...')
+    print('\nStopping obstacle avoidance demo...')
     cleanup()
     sys.exit(0)
 
 
+# ============================================================
+# FILTER
+# ============================================================
 class DistanceFilter:
-    """Simple moving-average filter for ultrasonic readings.
-
-    The ultrasonic sensor can produce noisy readings. Averaging the most recent
-    few values makes the avoidance trigger more stable.
-    """
+    """Simple moving average filter for sonar readings."""
     def __init__(self, window=DIST_WINDOW):
         self.window = window
         self.samples = []
@@ -174,110 +175,169 @@ class DistanceFilter:
 
 
 # ============================================================
-# SENSOR + DECISION FUNCTIONS
+# MOTION LAYER
 # ============================================================
-def read_distance_cm():
-    """Read front ultrasonic distance in centimeters.
+class MotionController:
+    def __init__(self, car):
+        self.car = car
+        self.command = 'stop'
+        self.last_yaw = 0.0
 
-    In the TurboPi examples, sonar.getDistance() returns millimeters,
-    so divide by 10 to convert to centimeters.
-    """
-    raw_mm = sonar.getDistance()
-    return raw_mm / 10.0
+    def stop_car(self):
+        self.command = 'stop'
+        self.last_yaw = 0.0
+        self.car.set_velocity(0, 90, 0)
 
+    def drive_forward(self, speed=FORWARD_SPEED):
+        self.command = 'forward'
+        self.last_yaw = 0.0
+        self.car.set_velocity(speed, 90, 0)
 
-def obstacle_detected(filtered_distance_cm, threshold_cm=SAFE_DISTANCE_CM):
-    """Return True when an obstacle is closer than the threshold."""
-    return filtered_distance_cm <= threshold_cm
+    def drive_reverse(self, speed=REVERSE_SPEED):
+        self.command = 'reverse'
+        self.last_yaw = 0.0
+        self.car.set_velocity(speed, 270, 0)
 
+    def turn_in_place(self, direction='left', yaw=TURN_YAW):
+        self.command = f'turn_{direction}'
+        if direction == 'left':
+            self.last_yaw = -abs(yaw)
+            self.car.set_velocity(0, 90, self.last_yaw)
+        else:
+            self.last_yaw = abs(yaw)
+            self.car.set_velocity(0, 90, self.last_yaw)
 
-# ============================================================
-# AVOIDANCE MANEUVER
-# ============================================================
-def avoid_obstacle():
-    """Perform a simple fixed avoidance maneuver.
+    def drive_forward_sweep(self, t_in_state, speed=FORWARD_SPEED,
+                            amplitude=SWEEP_YAW_AMPLITUDE, period=SWEEP_PERIOD):
+        """
+        Drive forward while smoothly oscillating yaw.
 
-    Sequence:
-    1. Stop
-    2. Reverse a little to create space
-    3. Turn away from the obstacle
-    4. Move forward to clear the obstacle region
-    5. Stop briefly and return control to main loop
-    """
-    global last_avoid_time
+        yaw(t) = amplitude * sin(2*pi*t/period)
 
-    set_led_color('red')
-    beep_once()
-
-    if DEBUG_PRINT:
-        print('Obstacle detected -> avoidance maneuver starting')
-
-    stop_car()
-    time.sleep(STOP_PAUSE)
-
-    if DEBUG_PRINT:
-        print('  reversing')
-    drive_reverse(REVERSE_SPEED)
-    time.sleep(REVERSE_TIME)
-
-    if DEBUG_PRINT:
-        print(f'  turning {TURN_DIRECTION}')
-    turn_in_place(TURN_DIRECTION, TURN_YAW)
-    time.sleep(TURN_TIME)
-
-    if DEBUG_PRINT:
-        print('  recovery forward')
-    drive_forward(FORWARD_SPEED)
-    time.sleep(FORWARD_RECOVERY_TIME)
-
-    stop_car()
-    time.sleep(0.10)
-
-    last_avoid_time = time.time()
-    set_led_color('yellow')
-
-    if DEBUG_PRINT:
-        print('Avoidance maneuver complete')
+        This causes a gentle left-right sweeping path so the front sonar
+        samples more than just the dead-ahead direction.
+        """
+        yaw = amplitude * math.sin((2.0 * math.pi * t_in_state) / period)
+        self.command = 'sweep_forward'
+        self.last_yaw = yaw
+        self.car.set_velocity(speed, 90, yaw)
+        return yaw
 
 
 # ============================================================
-# MAIN CONTROL LOOP
+# FSM
+# ============================================================
+class RobotFSM:
+    def __init__(self, motion):
+        self.motion = motion
+        self.state = State.CRUISE
+        self.state_start_time = time.time()
+        set_led_color('green')
+
+    def set_state(self, new_state):
+        self.state = new_state
+        self.state_start_time = time.time()
+
+        if DEBUG_PRINT:
+            print(f'--> Entering state: {self.state.name}')
+
+        if new_state == State.CRUISE:
+            set_led_color('green')
+
+        elif new_state == State.REVERSE:
+            set_led_color('red')
+
+        elif new_state == State.TURN:
+            set_led_color('blue')
+
+        elif new_state == State.RECOVER:
+            set_led_color('purple')
+
+    def time_in_state(self):
+        return time.time() - self.state_start_time
+
+    def update(self, distance_cm):
+        if self.state == State.CRUISE:
+            self.motion.drive_forward_sweep(
+                t_in_state=self.time_in_state(),
+                speed=FORWARD_SPEED,
+                amplitude=SWEEP_YAW_AMPLITUDE,
+                period=SWEEP_PERIOD
+            )
+
+            if distance_cm <= SAFE_DISTANCE_CM:
+                if DEBUG_PRINT:
+                    print('Sonar obstacle detected -> REVERSE')
+                self.set_state(State.REVERSE)
+                return
+
+        elif self.state == State.REVERSE:
+            self.motion.drive_reverse(REVERSE_SPEED)
+            if self.time_in_state() >= REVERSE_TIME:
+                self.set_state(State.TURN)
+                return
+
+        elif self.state == State.TURN:
+            self.motion.turn_in_place(TURN_DIRECTION, TURN_YAW)
+            if self.time_in_state() >= TURN_TIME:
+                self.set_state(State.RECOVER)
+                return
+
+        elif self.state == State.RECOVER:
+            self.motion.drive_forward(FORWARD_SPEED)
+            if self.time_in_state() >= FORWARD_RECOVERY_TIME:
+                self.set_state(State.CRUISE)
+                return
+
+
+# ============================================================
+# MAIN DEMO
 # ============================================================
 def main():
     global running, last_distance_cm
 
     signal.signal(signal.SIGINT, handle_signal)
 
-    sonar.setRGBMode(0)
+    try:
+        sonar.setRGBMode(0)
+        sonar.setPixelColor(0, (0, 0, 0))
+        sonar.setPixelColor(1, (0, 0, 0))
+    except Exception:
+        pass
+
     set_led_color('blue')
 
     dist_filter = DistanceFilter(DIST_WINDOW)
+    motion = MotionController(car)
+    fsm = RobotFSM(motion)
 
     running = True
-    print('TurboPi obstacle avoidance started')
-    print(f'SAFE_DISTANCE_CM = {SAFE_DISTANCE_CM:.1f} cm')
-    print(f'TURN_DIRECTION   = {TURN_DIRECTION}')
+    last_debug_time = 0.0
+
+    print('TurboPi obstacle avoidance FSM demo started')
+    print(f'SAFE_DISTANCE_CM      = {SAFE_DISTANCE_CM:.1f} cm')
+    print(f'TURN_DIRECTION        = {TURN_DIRECTION}')
+    print(f'SWEEP_YAW_AMPLITUDE   = {SWEEP_YAW_AMPLITUDE}')
+    print(f'SWEEP_PERIOD          = {SWEEP_PERIOD:.2f} s')
     print('Press Ctrl+C to stop\n')
 
     while running:
-        # Read and filter distance
         raw_distance = read_distance_cm()
         filtered_distance = dist_filter.update(raw_distance)
         last_distance_cm = filtered_distance
 
-        if DEBUG_PRINT:
-            print(f'Raw: {raw_distance:5.1f} cm | Filtered: {filtered_distance:5.1f} cm')
+        fsm.update(filtered_distance)
 
-        # If not currently avoiding and obstacle is close, trigger maneuver
         now = time.time()
-        cooldown_done = (now - last_avoid_time) > COOLDOWN_TIME
-
-        if cooldown_done and obstacle_detected(filtered_distance, SAFE_DISTANCE_CM):
-            avoid_obstacle()
-        else:
-            # Normal cruising state
-            set_led_color('green')
-            drive_forward(FORWARD_SPEED)
+        if DEBUG_PRINT and (now - last_debug_time) >= DEBUG_PRINT_PERIOD:
+            print(
+                f'State={fsm.state.name:8s} | '
+                f'RawDist={raw_distance:5.1f} cm | '
+                f'FiltDist={filtered_distance:5.1f} cm | '
+                f'Cmd={motion.command:13s} | '
+                f'Yaw={motion.last_yaw:6.3f}'
+            )
+            last_debug_time = now
 
         time.sleep(LOOP_DELAY)
 
