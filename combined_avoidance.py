@@ -4,24 +4,21 @@
 """
 Combined Avoidance and Color Detection - HiWonder TurboPi
 
-This version integrates:
-- color detection
-- sweep-based obstacle avoidance
-- live tuning tools for HSV ranges and contour area
+Diagnostic low-stress version:
+- ROI-based traffic light detection
+- gentler motor settings for testing shutdown behavior
+- LED commands are cached
+- motor commands are rate-limited and duplicate writes are skipped
+- all cv2.imshow() and cv2.waitKey() calls stay in the main thread
 
-Important fix:
-- All cv2.imshow() and cv2.waitKey() calls are handled in the main thread only.
-- The vision thread only processes images and updates shared state.
-
-Tuning features:
-- center sampling box
-- center BGR and HSV display
-- contour area display for red / yellow / green
-- optional mask windows for each color
-- throttled debug prints in terminal
+Purpose:
+- Since the no-motion version stayed powered on, this version tests whether
+  gentler motor commands avoid the shutdown problem.
 """
 
 import sys
+import json
+import os
 sys.path.append('/home/pi/TurboPi/')
 
 import cv2
@@ -41,72 +38,74 @@ if sys.version_info.major == 2:
     sys.exit(0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Hardware objects
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 car = mecanum.MecanumChassis()
 sonar = Sonar.Sonar()
 board = rrc.Board()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Motion / avoidance parameters
-# ─────────────────────────────────────────────────────────────────────────────
-FORWARD_SPEED = 35
-YELLOW_SPEED = 18
-REVERSE_SPEED = 30
+# -----------------------------------------------------------------------------
+FORWARD_SPEED = 12
+YELLOW_SPEED = 8
+REVERSE_SPEED = 10
 
 SAFE_DISTANCE_CM = 35.0
 DIST_WINDOW = 5
 LOOP_DELAY = 0.05
 
-REVERSE_TIME = 0.40
-TURN_TIME = 0.65
-FORWARD_RECOVERY_TIME = 0.45
+REVERSE_TIME = 0.20
+TURN_TIME = 0.30
+FORWARD_RECOVERY_TIME = 0.20
 COOLDOWN_TIME = 1.00
 
 TURN_DIRECTION = 'left'
-TURN_YAW = 0.45
+TURN_YAW = 0.15
 
 # Sweeping cruise motion
-SWEEP_YAW_AMPLITUDE = 0.35
-YELLOW_SWEEP_YAW_AMPLITUDE = 0.12
+SWEEP_YAW_AMPLITUDE = 0.10
+YELLOW_SWEEP_YAW_AMPLITUDE = 0.06
 SWEEP_PERIOD = 1.80
 
-DEBUG_PRINT = True
+DEBUG_PRINT = False
 DEBUG_PRINT_PERIOD = 0.20
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Camera parameters
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 CAMERA_FPS = 30
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Color detection tuning parameters
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 MIN_CONTOUR_AREA = 1500
 DETECTION_CONFIRM = 3
 COLOR_DEBOUNCE_S = 0.4
 
-VISION_DEBUG = True
+VISION_DEBUG = False
 VISION_DEBUG_PERIOD = 0.25
-SHOW_MASKS = True
+SHOW_MASKS = False
 
 SAMPLE_BOX_HALF = 8
 
-# OpenCV HSV:
-# H: 0-179
-# S: 0-255
-# V: 0-255
+TUNED_CONFIG_PATH = "traffic_light_tuned.json"
+
+# Default ROI: x1, y1, x2, y2
+DETECTION_ROI = (220, 40, 420, 220)
+
+# Default HSV ranges
 COLOR_RANGES = {
     "red": [
-        (np.array([0,   120,  70]), np.array([10,  255, 255])),
-        (np.array([170, 120,  70]), np.array([180, 255, 255])),
+        (np.array([0, 120, 70]), np.array([10, 255, 255])),
+        (np.array([170, 120, 70]), np.array([180, 255, 255])),
     ],
     "yellow": [
         (np.array([18, 100, 80]), np.array([35, 255, 255])),
@@ -117,9 +116,9 @@ COLOR_RANGES = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Shared thread state
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 detected_color = "none"
 shared_frame = None
 last_color_areas = {"red": 0, "yellow": 0, "green": 0}
@@ -140,11 +139,46 @@ stop_event = threading.Event()
 
 running = True
 last_distance_cm = 999.0
+last_led_color = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Config loader
+# -----------------------------------------------------------------------------
+def load_tuned_color_config():
+    global MIN_CONTOUR_AREA, COLOR_RANGES, DETECTION_ROI
+
+    if not os.path.exists(TUNED_CONFIG_PATH):
+        print("[Config] No tuned config found, using built-in defaults")
+        return
+
+    with open(TUNED_CONFIG_PATH, "r") as f:
+        cfg = json.load(f)
+
+    MIN_CONTOUR_AREA = int(cfg["min_contour_area"])
+    DETECTION_ROI = tuple(cfg["roi"])
+
+    COLOR_RANGES = {
+        "red": [
+            (np.array(cfg["ranges"]["red1"]["low"]), np.array(cfg["ranges"]["red1"]["high"])),
+            (np.array(cfg["ranges"]["red2"]["low"]), np.array(cfg["ranges"]["red2"]["high"])),
+        ],
+        "yellow": [
+            (np.array(cfg["ranges"]["yellow"]["low"]), np.array(cfg["ranges"]["yellow"]["high"])),
+        ],
+        "green": [
+            (np.array(cfg["ranges"]["green"]["low"]), np.array(cfg["ranges"]["green"]["high"])),
+        ],
+    }
+
+    print("[Config] Loaded tuned traffic-light config")
+    print(f"[Config] ROI={DETECTION_ROI}")
+    print(f"[Config] MIN_CONTOUR_AREA={MIN_CONTOUR_AREA}")
+
+
+# -----------------------------------------------------------------------------
 # FSM states
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class State(Enum):
     CRUISE = auto()
     REVERSE = auto()
@@ -152,10 +186,17 @@ class State(Enum):
     RECOVER = auto()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Motor / board helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def set_led_color(name):
+    global last_led_color
+
+    if name == last_led_color:
+        return
+
+    last_led_color = name
+
     try:
         if name == 'green':
             board.set_rgb([[1, 0, 255, 0], [2, 0, 255, 0]])
@@ -178,43 +219,56 @@ class MotionController:
         self.car = car
         self.command = 'stop'
         self.last_yaw = 0.0
+        self.last_cmd_time = 0.0
+        self.min_cmd_period = 0.08
+        self.last_cmd_tuple = None
+
+    def _send_velocity(self, speed, direction, yaw):
+        now = time.time()
+        cmd = (round(float(speed), 2), round(float(direction), 2), round(float(yaw), 2))
+
+        if self.last_cmd_tuple == cmd and (now - self.last_cmd_time) < self.min_cmd_period:
+            return
+
+        self.car.set_velocity(speed, direction, yaw)
+        self.last_cmd_tuple = cmd
+        self.last_cmd_time = now
 
     def stop_car(self):
         self.command = 'stop'
         self.last_yaw = 0.0
-        self.car.set_velocity(0, 90, 0)
+        self._send_velocity(0, 90, 0)
 
     def drive_forward(self, speed=FORWARD_SPEED):
         self.command = 'forward'
         self.last_yaw = 0.0
-        self.car.set_velocity(speed, 90, 0)
+        self._send_velocity(speed, 90, 0)
 
     def drive_reverse(self, speed=REVERSE_SPEED):
         self.command = 'reverse'
         self.last_yaw = 0.0
-        self.car.set_velocity(speed, 270, 0)
+        self._send_velocity(speed, 270, 0)
 
     def turn_in_place(self, direction='left', yaw=TURN_YAW):
         self.command = f'turn_{direction}'
         if direction == 'left':
             self.last_yaw = -abs(yaw)
-            self.car.set_velocity(0, 90, self.last_yaw)
         else:
             self.last_yaw = abs(yaw)
-            self.car.set_velocity(0, 90, self.last_yaw)
+        self._send_velocity(0, 90, self.last_yaw)
 
     def drive_forward_sweep(self, t_in_state, speed=FORWARD_SPEED,
                             amplitude=SWEEP_YAW_AMPLITUDE, period=SWEEP_PERIOD):
         yaw = amplitude * math.sin((2.0 * math.pi * t_in_state) / period)
         self.command = 'sweep_forward'
         self.last_yaw = yaw
-        self.car.set_velocity(speed, 90, yaw)
+        self._send_velocity(speed, 90, yaw)
         return yaw
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Sonar helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class DistanceFilter:
     def __init__(self, window=DIST_WINDOW):
         self.window = window
@@ -235,9 +289,9 @@ def obstacle_detected(filtered_cm, threshold_cm=SAFE_DISTANCE_CM):
     return filtered_cm <= threshold_cm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Avoidance FSM
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class RobotFSM:
     def __init__(self, motion):
         self.motion = motion
@@ -319,13 +373,30 @@ class RobotFSM:
                 return
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Color detection helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+def clamp_roi(roi, frame_shape):
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = roi
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(x1 + 1, min(w, x2))
+    y2 = max(y1 + 1, min(h, y2))
+    return (x1, y1, x2, y2)
+
+
 def apply_mask(hsv: np.ndarray, color: str) -> np.ndarray:
     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     for lo, hi in COLOR_RANGES[color]:
         mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
+    return mask
+
+
+def clean_mask(mask: np.ndarray) -> np.ndarray:
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
 
 
@@ -336,22 +407,20 @@ def largest_contour_area(mask: np.ndarray) -> int:
     return int(cv2.contourArea(max(contours, key=cv2.contourArea)))
 
 
-def get_center_box_values(frame: np.ndarray, hsv: np.ndarray):
-    """
-    Average BGR and HSV values inside a small box at the frame center.
-    This is more stable than using a single pixel.
-    """
-    h, w = frame.shape[:2]
+def get_center_box_values(roi_bgr: np.ndarray, roi_hsv: np.ndarray, roi_rect):
+    x1, y1, x2, y2 = roi_rect
+
+    h, w = roi_bgr.shape[:2]
     cx = w // 2
     cy = h // 2
 
-    x1 = max(0, cx - SAMPLE_BOX_HALF)
-    x2 = min(w, cx + SAMPLE_BOX_HALF + 1)
-    y1 = max(0, cy - SAMPLE_BOX_HALF)
-    y2 = min(h, cy + SAMPLE_BOX_HALF + 1)
+    sx1 = max(0, cx - SAMPLE_BOX_HALF)
+    sx2 = min(w, cx + SAMPLE_BOX_HALF + 1)
+    sy1 = max(0, cy - SAMPLE_BOX_HALF)
+    sy2 = min(h, cy + SAMPLE_BOX_HALF + 1)
 
-    bgr_roi = frame[y1:y2, x1:x2]
-    hsv_roi = hsv[y1:y2, x1:x2]
+    bgr_roi = roi_bgr[sy1:sy2, sx1:sx2]
+    hsv_roi = roi_hsv[sy1:sy2, sx1:sx2]
 
     bgr_mean = np.mean(bgr_roi.reshape(-1, 3), axis=0)
     hsv_mean = np.mean(hsv_roi.reshape(-1, 3), axis=0)
@@ -359,13 +428,20 @@ def get_center_box_values(frame: np.ndarray, hsv: np.ndarray):
     center_bgr = tuple(int(v) for v in bgr_mean)
     center_hsv = tuple(int(v) for v in hsv_mean)
 
-    return (cx, cy, x1, y1, x2, y2), center_bgr, center_hsv
+    full_cx = x1 + cx
+    full_cy = y1 + cy
+    full_sx1 = x1 + sx1
+    full_sy1 = y1 + sy1
+    full_sx2 = x1 + sx2
+    full_sy2 = y1 + sy2
+
+    return (full_cx, full_cy, full_sx1, full_sy1, full_sx2, full_sy2), center_bgr, center_hsv
 
 
 def draw_overlay(frame: np.ndarray, color: str, areas: dict,
                  fsm_state: str = "", distance_cm: float = -1.0,
                  center_bgr=None, center_hsv=None,
-                 sample_box=None) -> np.ndarray:
+                 sample_box=None, detection_roi=None) -> np.ndarray:
     overlay = frame.copy()
     label_color = {
         "red": (0, 0, 255),
@@ -452,6 +528,19 @@ def draw_overlay(frame: np.ndarray, color: str, areas: dict,
         1
     )
 
+    if detection_roi is not None:
+        rx1, ry1, rx2, ry2 = detection_roi
+        cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), (0, 255, 255), 2)
+        cv2.putText(
+            overlay,
+            "ROI",
+            (rx1, max(20, ry1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2
+        )
+
     if sample_box is not None:
         cx, cy, x1, y1, x2, y2 = sample_box
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 255), 2)
@@ -460,9 +549,9 @@ def draw_overlay(frame: np.ndarray, color: str, areas: dict,
     return overlay
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Vision thread
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def vision_thread() -> None:
     global detected_color
     global shared_frame
@@ -496,14 +585,18 @@ def vision_thread() -> None:
             time.sleep(0.05)
             continue
 
-        blurred = cv2.GaussianBlur(frame, (7, 7), 0)
+        roi_rect = clamp_roi(DETECTION_ROI, frame.shape)
+        x1, y1, x2, y2 = roi_rect
+
+        roi_bgr = frame[y1:y2, x1:x2]
+        blurred = cv2.GaussianBlur(roi_bgr, (7, 7), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        sample_box, center_bgr, center_hsv = get_center_box_values(frame, hsv)
+        sample_box, center_bgr, center_hsv = get_center_box_values(roi_bgr, hsv, roi_rect)
 
-        red_mask = apply_mask(hsv, "red")
-        yellow_mask = apply_mask(hsv, "yellow")
-        green_mask = apply_mask(hsv, "green")
+        red_mask = clean_mask(apply_mask(hsv, "red"))
+        yellow_mask = clean_mask(apply_mask(hsv, "yellow"))
+        green_mask = clean_mask(apply_mask(hsv, "green"))
 
         areas = {
             "red": largest_contour_area(red_mask),
@@ -569,9 +662,9 @@ def vision_thread() -> None:
     print("[Vision] thread exited")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Cleanup / signal handler
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def cleanup():
     global running
     running = False
@@ -598,13 +691,15 @@ def handle_signal(signum, frame):
     sys.exit(0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main loop
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def main():
     global running, last_distance_cm
 
     signal.signal(signal.SIGINT, handle_signal)
+
+    load_tuned_color_config()
 
     try:
         sonar.setRGBMode(0)
@@ -630,6 +725,7 @@ def main():
     print(f'TURN_DIRECTION        = {TURN_DIRECTION}')
     print(f'SWEEP_YAW_AMPLITUDE   = {SWEEP_YAW_AMPLITUDE}')
     print(f'SWEEP_PERIOD          = {SWEEP_PERIOD:.2f} s')
+    print(f'DETECTION_ROI         = {DETECTION_ROI}')
     print(f'MIN_CONTOUR_AREA      = {MIN_CONTOUR_AREA}')
     print('Press Ctrl+C to stop\n')
 
@@ -680,7 +776,8 @@ def main():
                 filtered_distance,
                 center_bgr=center_bgr,
                 center_hsv=center_hsv,
-                sample_box=sample_box
+                sample_box=sample_box,
+                detection_roi=DETECTION_ROI
             )
             cv2.imshow("Combined Avoidance", annotated)
 
